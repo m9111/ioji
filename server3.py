@@ -8,7 +8,7 @@ from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 import base64
 import requests
-from thefuzz import fuzz, process
+
 from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,7 +22,7 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_openai import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain, LLMChain
+from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import PromptTemplate
 from langchain.chains.question_answering import load_qa_chain
 
@@ -33,12 +33,12 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 CHUNK_SIZE = int(os.getenv('CHUNK_SIZE', 1000))
 CHUNK_OVERLAP = int(os.getenv('CHUNK_OVERLAP', 200))
-MODEL_NAME = os.getenv('MODEL_NAME', 'gpt-4o-mini')
+MODEL_NAME = os.getenv('MODEL_NAME', 'gpt-3.5-turbo')
 
 # Default system message
-DEFAULT_SYSTEM_MESSAGE = """You are a helpful AI assistant with access to knowledge about UBIK Solutions. 
+DEFAULT_SYSTEM_MESSAGE = """strictly answer in english and dont go out of the context that is provided to u, You are a helpful AI assistant with access to knowledge about Ilesh Sir and UBIK Solutions. 
 Answer questions based on the provided context. If you don't know something or if it's not in the context, 
-say so directly instead of making up information. ,Your name is ubik ai, answer mostly under 50 words unless very much required"""
+say so directly instead of making up information. Your name is ethinext pharma ai, answer mostly under 50 words unless very much required"""
 
 logging.basicConfig(
     filename='app_logs.txt',
@@ -105,7 +105,38 @@ def get_text_chunks(text: str):
     )
     return text_splitter.split_text(text)
 
+async def handle_speech_to_text(file: UploadFile):
+    if file is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "No file provided."}
+        )
 
+    webm_path = os.path.join("data", f"temp_{uuid.uuid4().hex}.webm")
+    
+    try:
+        content = await file.read()
+        with open(webm_path, "wb") as f:
+            f.write(content)
+
+        with open(webm_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file
+            )
+
+        return {"status": "success", "text": transcript.text}
+
+    except Exception as e:
+        logger.error(f"Error in speech-to-text: {e}")
+        return {
+            "status": "error",
+            "error": "An error occurred during transcription."
+        }
+
+    finally:
+        if os.path.exists(webm_path):
+            os.remove(webm_path)
 
 def initialize_global_vectorstore():
     global global_vectorstore
@@ -135,231 +166,69 @@ def initialize_global_vectorstore():
         logger.info("Vectorstore has been created.")
     return True, "[SYSTEM MESSAGE] Vectorstore was created successfully."
 
-# Add this after the existing imports
-from typing import Dict, Tuple
-
-# Word mapping dictionary for speech recognition corrections
-WORD_MAPPINGS: Dict[str, str] = {
-    # Company and name variations
-    "ilish": "ilesh",
-    "irish": "ilesh",
-    "ellis": "ilesh",
-    "eubank": "ubik",
-    "ubique": "ubik",
-    "unique": "ubik",
-    "you bike": "ubik",
-    "ethyle glue":"ethiglo",
-    "igloo":"ethiglo",
-    
-    # Common business terms
-    "solution": "solutions",
-    "internet": "internet",
-    "website": "website",
-    "software": "software",
-    
-    # Numbers and amounts
-    "too": "two",
-    "for": "four",
-    "won": "one",
-    
-    # Common phrases
-    "thanks": "thank you",
-    "okay": "ok",
-    "bye": "goodbye"
-}
-
-def apply_word_corrections(text: str) -> Tuple[str, list]:
-    """
-    Apply word corrections to transcribed text and track changes made.
-    
-    Args:
-        text: The original transcribed text
-        
-    Returns:
-        Tuple containing:
-        - Corrected text
-        - List of corrections made (original -> corrected)
-    """
-    words = text.lower().split()
-    corrections = []
-    corrected_words = []
-    
-    for word in words:
-        if word in WORD_MAPPINGS:
-            corrected = WORD_MAPPINGS[word]
-            corrections.append((word, corrected))
-            corrected_words.append(corrected)
-        else:
-            corrected_words.append(word)
-    
-    return ' '.join(corrected_words), corrections
-
-# Modify the handle_speech_to_text function to include corrections
-async def handle_speech_to_text(file: UploadFile):
-    if file is None:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "No file provided."}
-        )
-
-    webm_path = os.path.join("data", f"temp_{uuid.uuid4().hex}.webm")
-    
-    try:
-        content = await file.read()
-        with open(webm_path, "wb") as f:
-            f.write(content)
-
-        with open(webm_path, "rb") as audio_file:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file
-            )
-        
-        # Apply word corrections
-        corrected_text, corrections = apply_word_corrections(transcript.text)
-        
-        return {
-            "status": "success",
-            "original_text": transcript.text,
-            "corrected_text": corrected_text,
-            "corrections": corrections
-        }
-
-    except Exception as e:
-        logger.error(f"Error in speech-to-text: {e}")
-        return {
-            "status": "error",
-            "error": "An error occurred during transcription."
-        }
-
-    finally:
-        if os.path.exists(webm_path):
-            os.remove(webm_path)
-
 def create_or_refresh_user_chain(user_id: str):
-    """
-    Creates or refreshes a user's conversation chain with semantic understanding and fuzzy matching capabilities.
-    """
     user_state = get_user_state(user_id)
     if user_state['chain'] is None:
         if global_vectorstore is None:
             return False, "Global vectorstore is not initialized."
 
-        # Create fuzzy matching corpus from vectorstore
-        fuzzy_corpus = create_fuzzy_corpus(global_vectorstore)
-        user_state['fuzzy_corpus'] = fuzzy_corpus
-
         # Create chat model with system message
         chat_llm = ChatOpenAI(model=MODEL_NAME, temperature=0.7)
-        
-        # Update memory configuration to specify output key
-        memory = ConversationBufferMemory(
-            memory_key='chat_history',
-            return_messages=True,
-            output_key='answer'  # Specify which key to store in memory
-        )
-        user_state['memory'] = memory  # Update the user's memory instance
-        
-        # Create QA prompt template with system message
+
+        # Create custom QA prompt template that includes system message
+        condense_template = """Given the following conversation and a follow up question, rephrase the follow up question to be a standalone question, in its original language.
+
+        Chat History:
+        {chat_history}
+        Follow Up Input: {question}
+        Standalone question:"""
+        CONDENSE_QUESTION_PROMPT = PromptTemplate.from_template(condense_template)
+
         qa_template = f"""
         {user_state['system_message']}
 
         Context: {{context}}
+        
         Question: {{question}}
         
-        Answer in a helpful and natural way. If the answer cannot be found in the context, 
-        say so politely instead of making assumptions. Keep answers under 50 words unless more detail is necessary.
-
-        Answer:"""
+        Answer: """
         
         QA_PROMPT = PromptTemplate(
             template=qa_template,
             input_variables=["context", "question"]
         )
 
-        # Create conversation chain
-        conversation_chain = ConversationalRetrievalChain.from_llm(
+        # Create the chain
+        user_state['chain'] = ConversationalRetrievalChain.from_llm(
             llm=chat_llm,
-            retriever=global_vectorstore.as_retriever(
-                search_type="similarity_score_threshold",
-                search_kwargs={
-                    "k": 4,
-                    "score_threshold": 0.3,
-                    "fetch_k": 6
-                }
-            ),
-            memory=memory,
-            return_source_documents=True,
+            retriever=global_vectorstore.as_retriever(),
+            memory=user_state['memory'],
+            condense_question_prompt=CONDENSE_QUESTION_PROMPT,
             combine_docs_chain_kwargs={'prompt': QA_PROMPT}
         )
-
-        # Store chain in user state
-        user_state['chain'] = conversation_chain
         
-        logger.info(f"New conversation chain created for user {user_id}")
-        return True, "Conversation chain created successfully."
+        logger.info(f"New conversation chain created for user {user_id} with system message: {user_state['system_message']}")
+        return True, "Conversation chain created."
     else:
-        return True, "Conversation chain already exists and is ready to use."
-    
+        return True, "Conversation chain already exists."
+
 def handle_userinput(user_question: str, user_id: str):
     user_state = get_user_state(user_id)
     conversation_chain = user_state['chain']
-    
     if not conversation_chain:
         return None
 
-    try:
-        input_data = {'question': user_question}
-        response = conversation_chain(input_data)
-        answer = response['answer']
+    input_data = {'question': user_question}
+    log_event("PromptSentToGPT", f"Prompt: {input_data}", user_id=user_id)
 
-        user_state['history'].append((user_question, answer))
-        log_event("UserQuestion", f"Q: {user_question}", user_id=user_id)
-        log_event("AIAnswer", f"A: {answer}", user_id=user_id)
+    response = conversation_chain(input_data)
+    answer = response['answer']
 
-        return {'text': answer}
-    except Exception as e:
-        logger.error(f"Error processing question: {e}")
-        return {'text': "I apologize, but I encountered an error processing your question. Please try again."}
-    
-def get_fuzzy_matches(word: str, word_list: list[str], threshold: int = 80) -> list[tuple[str, int]]:
-    """
-    Find fuzzy matches for a word in a word list.
-    Returns list of (word, score) tuples for matches above threshold.
-    """
-    return process.extractBests(word, word_list, scorer=fuzz.ratio, score_cutoff=threshold)
+    user_state['history'].append((user_question, answer))
+    log_event("UserQuestion", f"Q: {user_question}", user_id=user_id)
+    log_event("AIAnswer", f"A: {answer}", user_id=user_id)
 
-def create_fuzzy_corpus(vectorstore) -> list[str]:
-    """
-    Create a corpus of words from the vectorstore for fuzzy matching
-    """
-    all_docs = vectorstore.similarity_search("", k=1000)  # Get a large sample of documents
-    word_set = set()
-    
-    for doc in all_docs:
-        words = doc.page_content.lower().split()
-        word_set.update(words)
-    
-    return list(word_set)
-
-
-def process_with_fuzzy_matching(question: str, fuzzy_corpus: list[str]) -> tuple[str, list[dict]]:
-    """
-    Process a question using fuzzy matching to find potential corrections
-    """
-    words = question.lower().split()
-    fuzzy_matches = []
-    
-    for word in words:
-        matches = get_fuzzy_matches(word, fuzzy_corpus)
-        if matches and matches[0][0] != word:  # If we found matches different from the original word
-            fuzzy_matches.append({
-                'original': word,
-                'matches': matches
-            })
-    
-    return question, fuzzy_matches
-
+    return {'text': answer}
 
 @app.on_event("startup")
 async def startup_event():
@@ -599,11 +468,9 @@ async def text_to_speech_api(request: Request):
             content={"error": "An internal error occurred during text-to-speech synthesis."}
         )
 
-# Update the synthesize_speech endpoint in your FastAPI server
 
 # You can remove or comment out the StaticFiles mounting since we're not storing files anymore
 # app.mount("/data", StaticFiles(directory="data"), name="data")
 
 # Command to run:
 # uvicorn server3:app --host 0.0.0.0 --port 8000 --reload
-#pip install thefuzz[speedup]
